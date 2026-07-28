@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+#
+# dcx - execute a command in the running Docker Compose container whose bind
+# mount contains the current directory.
+#
+# Usage:
+#   dcx
+#   dcx command [argument ...]
+#   dcx -s <service> [command [argument ...]]
+#   dcx -l | --list
+#
+# Requires:
+#   - Docker Compose v2 (`docker compose`)
+#   - jq
+
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+dcx - execute a command in a Docker Compose container
+
+Usage:
+  dcx
+      Detect and print the running container that would be selected for $PWD.
+      Do not execute a command.
+
+  dcx command [argument ...]
+      Detect the running container whose bind mount contains $PWD and execute
+      the command.
+
+  dcx -s, --service SERVICE [command [argument ...]]
+      Use an exact Compose service instead of detecting it from $PWD.
+
+  dcx -l, --list
+      List running containers and their bind mounts.
+
+  dcx -h, --help
+      Show this help.
+
+Examples:
+  dcx
+  dcx ls -la
+  dcx -- ls -la
+  dcx python app.py
+  dcx node src/index.js
+  dcx npm test
+  dcx pnpm exec tsc --noEmit
+  dcx bash
+  dcx --service web sh
+USAGE
+}
+fail() {
+    echo "dcx: $*" >&2
+    exit 1
+}
+
+find_compose_file() {
+    local dir
+    dir="$(realpath -m "$PWD")"
+
+    while true; do
+        local filename
+        for filename in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+            if [[ -f "$dir/$filename" ]]; then
+                printf '%s\n' "$dir/$filename"
+                return 0
+            fi
+        done
+
+        [[ "$dir" == "/" ]] && return 1
+        dir="$(dirname "$dir")"
+    done
+}
+
+command -v docker >/dev/null 2>&1 || fail "docker is required"
+docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is required"
+command -v jq >/dev/null 2>&1 || fail "jq is required"
+
+# Use terminal attributes only for interactive output. They adapt to both light and
+# dark terminal themes. NO_COLOR disables styling as expected by many CLI tools.
+if [[ -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+    if [[ -t 1 ]]; then
+        BOLD=$'\e[1m'
+        DIM=$'\e[2m'
+        RESET=$'\e[0m'
+    else
+        BOLD=
+        DIM=
+        RESET=
+    fi
+
+    if [[ -t 2 ]]; then
+        STDERR_BOLD=$'\e[1m'
+        STDERR_RESET=$'\e[0m'
+    else
+        STDERR_BOLD=
+        STDERR_RESET=
+    fi
+else
+    BOLD=
+    DIM=
+    RESET=
+    STDERR_BOLD=
+    STDERR_RESET=
+fi
+
+list_only=false
+service=""
+command_args=()
+
+while (( $# > 0 )); do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -l|--list)
+            list_only=true
+            shift
+            ;;
+        -s|--service)
+            (( $# >= 2 )) || fail "$1 requires a service name"
+            service="$2"
+            shift 2
+            ;;
+        --service=*)
+            service="${1#*=}"
+            [[ -n "$service" ]] || fail "--service requires a service name"
+            shift
+            ;;
+        --)
+            shift
+            command_args=("$@")
+            break
+            ;;
+        -*)
+            # Once command parsing begins, options belong to the command.
+            command_args=("$@")
+            break
+            ;;
+        *)
+            command_args=("$@")
+            break
+            ;;
+    esac
+done
+
+if $list_only && (( ${#command_args[@]} > 0 )); then
+    fail "--list cannot be combined with a command"
+fi
+
+compose_file="$(find_compose_file)" || \
+    fail "no Compose file found in the current directory or its parents"
+
+compose_dir="$(dirname "$compose_file")"
+compose=(docker compose --project-directory "$compose_dir" -f "$compose_file")
+
+mapfile -t container_ids < <("${compose[@]}" ps --status running -q)
+[[ ${#container_ids[@]} -gt 0 ]] || fail "this Compose project has no running containers"
+
+inspect_file="$(mktemp)"
+trap 'rm -f "$inspect_file"' EXIT
+
+docker inspect "${container_ids[@]}" > "$inspect_file"
+
+if $list_only; then
+    current_service=""
+    current_container=""
+    mount_sources=()
+    mount_destinations=()
+    mount_modes=()
+
+    print_container() {
+        local count=${#mount_sources[@]}
+        (( count > 0 )) || return 0
+
+        if [[ -n "$current_service" ]]; then
+            printf '%s%s%s %s(%s)%s\n' \
+                "$BOLD" "$current_service" "$RESET" \
+                "$DIM" "$current_container" "$RESET"
+        else
+            printf '%s%s%s\n' "$BOLD" "$current_container" "$RESET"
+        fi
+
+        local i branch mode_suffix
+        for ((i = 0; i < count; i++)); do
+            if (( i == count - 1 )); then
+                branch='└─'
+            else
+                branch='├─'
+            fi
+
+            mode_suffix=""
+            if [[ -n "${mount_modes[i]}" ]]; then
+                mode_suffix=" [${mount_modes[i]}]"
+            fi
+
+            printf '  %s%s %s -> %s%s%s\n' \
+                "$DIM" "$branch" \
+                "${mount_sources[i]}" "${mount_destinations[i]}" "$mode_suffix" "$RESET"
+        done
+    }
+
+    while IFS=$'\t' read -r record_type field1 field2 field3; do
+        if [[ "$record_type" == "container" ]]; then
+            print_container
+
+            current_service="$field1"
+            current_container="$field2"
+            mount_sources=()
+            mount_destinations=()
+            mount_modes=()
+            continue
+        fi
+
+        source="$field1"
+        destination="$field2"
+        mode="$field3"
+
+        # `-d` follows symlinks, so directories and symlinks to directories qualify.
+        [[ -d "$source" ]] || continue
+
+        mount_sources+=("$source")
+        mount_destinations+=("$destination")
+        mount_modes+=("$mode")
+    done < <(
+        jq -r '
+            .[] |
+            (
+                (.Config.Labels["com.docker.compose.service"] // (.Name | ltrimstr("/"))) as $service |
+                (.Name | ltrimstr("/")) as $container |
+                ["container", $service, $container] | @tsv
+            ),
+            (
+                .Mounts[]? |
+                select(.Type == "bind") |
+                select((.Source? | type) == "string" and .Source != "") |
+                ["mount", .Source, (.Destination // ""), (.Mode // "")] | @tsv
+            )
+        ' "$inspect_file"
+    )
+
+    print_container
+    exit 0
+fi
+
+selected_id=""
+selected_service=""
+selected_container=""
+selected_workdir=""
+
+if [[ -n "$service" ]]; then
+    mapfile -t service_ids < <("${compose[@]}" ps --status running -q "$service")
+
+    [[ ${#service_ids[@]} -gt 0 ]] || \
+        fail "no running container found for service '$service'"
+    [[ ${#service_ids[@]} -eq 1 ]] || \
+        fail "service '$service' has multiple running containers; exact selection is ambiguous"
+
+    selected_id="${service_ids[0]}"
+else
+    pwd_real="$(realpath -m "$PWD")"
+
+    matches=()
+    best_score=-1
+
+    while IFS=$'\t' read -r candidate_id candidate_service candidate_container candidate_source candidate_destination; do
+        # `-d` follows symlinks, so symlinks to directories are accepted too.
+        [[ -d "$candidate_source" ]] || continue
+
+        source_real="$(realpath -m "$candidate_source")"
+        if [[ "$pwd_real" != "$source_real" && "$pwd_real" != "$source_real/"* ]]; then
+            continue
+        fi
+
+        score=${#source_real}
+        candidate="$candidate_id"$'\t'"$candidate_service"$'\t'"$candidate_container"$'\t'"$source_real"$'\t'"$candidate_destination"
+
+        if (( score > best_score )); then
+            matches=("$candidate")
+            best_score=$score
+        elif (( score == best_score )); then
+            matches+=("$candidate")
+        fi
+    done < <(
+        jq -r '
+            .[] as $container |
+            $container.Mounts[]? |
+            select(.Type == "bind") |
+            select((.Source? | type) == "string" and .Source != "") |
+            [
+                $container.Id,
+                ($container.Config.Labels["com.docker.compose.service"] // ""),
+                ($container.Name | ltrimstr("/")),
+                .Source,
+                (.Destination // "")
+            ] |
+            @tsv
+        ' "$inspect_file"
+    )
+
+    [[ ${#matches[@]} -gt 0 ]] || \
+        fail "no running Compose container has a bind mount containing '$pwd_real'"
+
+    if [[ ${#matches[@]} -gt 1 ]]; then
+        echo "dcx: multiple containers have equally specific matching bind mounts:" >&2
+        for match in "${matches[@]}"; do
+            IFS=$'\t' read -r _id match_service match_container match_source <<< "$match"
+            printf '  %s (%s): %s\n' "$match_service" "$match_container" "$match_source" >&2
+        done
+        fail "specify an exact service name with: dcx --service SERVICE"
+    fi
+
+    IFS=$'\t' read -r selected_id selected_service selected_container selected_source selected_destination <<< "${matches[0]}"
+
+    relative_path="${pwd_real#"$selected_source"}"
+    relative_path="${relative_path#/}"
+    selected_workdir="$selected_destination"
+    [[ -n "$relative_path" ]] && selected_workdir="${selected_workdir%/}/$relative_path"
+fi
+
+if [[ -z "$selected_service" || -z "$selected_container" ]]; then
+    IFS=$'\t' read -r selected_service selected_container < <(
+        docker inspect "$selected_id" | jq -r '
+            .[0] |
+            [
+                (.Config.Labels["com.docker.compose.service"] // ""),
+                (.Name | ltrimstr("/"))
+            ] |
+            @tsv
+        '
+    )
+fi
+
+# For an explicitly selected service, translate the host working directory through
+# its most specific qualifying bind mount when possible.
+if [[ -z "$selected_workdir" ]]; then
+    pwd_real="$(realpath -m "$PWD")"
+    best_source=""
+    best_destination=""
+
+    while IFS=$'\t' read -r candidate_source candidate_destination; do
+        [[ -d "$candidate_source" ]] || continue
+        source_real="$(realpath -m "$candidate_source")"
+
+        if [[ "$pwd_real" == "$source_real" || "$pwd_real" == "$source_real/"* ]]; then
+            if (( ${#source_real} > ${#best_source} )); then
+                best_source="$source_real"
+                best_destination="$candidate_destination"
+            fi
+        fi
+    done < <(
+        docker inspect "$selected_id" | jq -r '
+            .[0].Mounts[]? |
+            select(.Type == "bind") |
+            select((.Source? | type) == "string" and .Source != "") |
+            [.Source, (.Destination // "")] |
+            @tsv
+        '
+    )
+
+    if [[ -n "$best_source" && -n "$best_destination" ]]; then
+        relative_path="${pwd_real#"$best_source"}"
+        relative_path="${relative_path#/}"
+        selected_workdir="$best_destination"
+        [[ -n "$relative_path" ]] && selected_workdir="${selected_workdir%/}/$relative_path"
+    fi
+fi
+
+printf '%s==> %s (%s)%s\n' \
+    "$STDERR_BOLD" "$selected_service" "$selected_container" "$STDERR_RESET" >&2
+
+if (( ${#command_args[@]} == 0 )); then
+    if [[ -n "$selected_workdir" ]]; then
+        printf '    workdir: %s\n' "$selected_workdir" >&2
+    fi
+    exit 0
+fi
+
+exec_options=()
+[[ -t 0 && -t 1 ]] || exec_options+=(-T)
+[[ -n "$selected_workdir" ]] && exec_options+=(--workdir "$selected_workdir")
+
+exec "${compose[@]}" exec "${exec_options[@]}" "$selected_service" "${command_args[@]}"

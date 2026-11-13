@@ -34,6 +34,10 @@ You can also run it directly from the repository checkout.
 ## Usage
 
 ```bash
+# Show the version or help (works outside a Compose project)
+dcx --version
+dcx --help
+
 # Show the selected container for the current directory
 dcx
 

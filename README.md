@@ -44,6 +44,9 @@ dcx
 # Run a command in the matching container
 dcx python app.py
 
+# Start Bash in the matching container
+dcx bash
+
 # Run a command in a specific Compose service
 dcx --service web sh
 ```

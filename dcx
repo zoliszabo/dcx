@@ -381,4 +381,16 @@ exec_options=()
 [[ -t 0 && -t 1 ]] || exec_options+=(-T)
 [[ -n "$selected_workdir" ]] && exec_options+=(--workdir "$selected_workdir")
 
-exec "${compose[@]}" exec "${exec_options[@]}" "$selected_service" "${command_args[@]}"
+# Compose exec does not inherit the host's locale. Forward the settings that
+# control language and character encoding, using UTF-8 when none is set.
+locale_options=()
+have_locale=false
+for var in LANG LANGUAGE LC_ALL LC_CTYPE; do
+    if [[ -n "${!var:-}" ]]; then
+        locale_options+=(-e "$var=${!var}")
+        [[ "$var" == LANGUAGE ]] || have_locale=true
+    fi
+done
+$have_locale || locale_options+=(-e LANG=C.UTF-8)
+
+exec "${compose[@]}" exec "${exec_options[@]}" "${locale_options[@]}" "$selected_service" "${command_args[@]}"

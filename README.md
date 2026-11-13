@@ -43,3 +43,19 @@ dcx python app.py
 # Run a command in a specific Compose service
 dcx --service web sh
 ```
+
+## Locales
+
+`dcx` forwards nonempty host `LANG`, `LANGUAGE`, `LC_ALL`, and `LC_CTYPE`
+variables to the command in the container. If `LANG`, `LC_ALL`, and `LC_CTYPE`
+are all empty or unset, it passes `LANG=C.UTF-8` as a UTF-8 default.
+
+The forwarded locale must be available in the image. If your host uses a locale
+that the container does not provide, override it with one the image supports:
+
+```bash
+LC_ALL=C.UTF-8 dcx bash
+```
+
+`C.UTF-8` is available in many common images, but availability depends on the
+image. Install or generate another locale in the image if needed.

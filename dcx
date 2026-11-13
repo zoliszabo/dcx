@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.2"
 
 usage() {
     printf 'dcx v%s - execute a command in a Docker Compose container\n' "$VERSION"

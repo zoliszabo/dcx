@@ -54,6 +54,8 @@ Examples:
   dcx pnpm exec tsc --noEmit
   dcx bash
   dcx --service web sh
+
+Source code and documentation at https://github.com/zoliszabo/dcx
 USAGE
 }
 fail() {
